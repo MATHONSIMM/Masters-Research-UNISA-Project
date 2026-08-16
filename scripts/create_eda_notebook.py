@@ -536,6 +536,6 @@ print("Note: unconditional estimates only. Conditional VaR via GARCH follows in 
 
 nb['cells'] = cells
 
-out = ROOT / 'notebooks' / 'EDA_VaR_Research.ipynb'
+out = ROOT / 'notebooks' / 'Exploratory Data Analysis (EDA).ipynb'
 nbf.write(nb, str(out))
 print(f"Written: {out}  ({len(cells)} cells)")

@@ -298,6 +298,6 @@ for f in ['prices_clean.csv', 'log_returns_clean.csv', 'log_returns_winsorised.c
 
 nb['cells'] = cells
 
-out = ROOT / 'notebooks' / 'Data_Cleaning_VaR_Research.ipynb'
+out = ROOT / 'notebooks' / 'Data Cleaning.ipynb'
 nbf.write(nb, str(out))
 print(f"Written: {out}  ({len(cells)} cells)")
