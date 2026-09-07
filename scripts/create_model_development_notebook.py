@@ -223,6 +223,15 @@ for name, res in [('GARCH(1,1)-t', garch_full), ('EGARCH(1,1)-t', egarch_full), 
     print(f"\\n{name} — in-sample parameters")
     print(res.params.round(4).to_string())
     print(f"Log-likelihood: {res.loglikelihood:.2f}   AIC: {res.aic:.2f}   BIC: {res.bic:.2f}")
+
+    inference = pd.DataFrame({
+        'coef':    res.params,
+        'std_err': res.std_err,
+        'z':       res.tvalues,
+        'p_value': res.pvalues,
+    }).round(4)
+    print(f"\\n{name} — parameter inference")
+    print(inference.to_string())
 """))
 
 cells.append(md("### 4.2 Walk-forward conditional variance forecasts"))
