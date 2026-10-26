@@ -477,6 +477,248 @@ print(f"Mean hybrid forecast volatility : {sigma_hybrid.mean()*100:.3f}%")
 print(f"Actual test-period volatility   : {portfolio.loc[test_idx].std()*100:.3f}%")
 """))
 
+# 5B. Standalone LSTM Volatility Model
+cells.append(md(
+    "## 5B. Standalone LSTM Volatility Model\n\n"
+    "The refinement layer above only has a story to tell once it is compared against something that "
+    "is *not* refining anything. This section builds a second, fully independent LSTM that never sees "
+    "a GARCH-family output of any kind — no conditional volatility, no standardised residual — so that "
+    "any difference between it and the Hybrid model in Section 6 can be attributed to the presence of "
+    "the GARCH layer's information rather than to some unrelated change in architecture or training "
+    "procedure. Everything else — the look-back window, the target, the train/test split, the network "
+    "shape, the optimiser, the early-stopping rule, and the Duan smearing correction — is kept identical "
+    "to Section 5, so the comparison isolates one thing: what the inputs contain. All new objects in "
+    "this section carry a `standalone_` prefix specifically so that nothing here can silently overwrite "
+    "the `lstm_model`, `scaler`, or `smearing_factor` that Section 7 later persists for the Hybrid model."
+))
+
+cells.append(md(
+    "### 5B.1 Feature construction — no GARCH-family output of any kind\n\n"
+    "The input at day $t$ is again a 21-day sequence, but built purely from the portfolio's own return "
+    "history: the return itself, the 5-day and 21-day rolling realised standard deviation, and the "
+    "squared return — the same kind of self-contained, backward-looking features a researcher would "
+    "reach for before ever fitting a GARCH model. The target is unchanged: "
+    "$\\log(r_{t+1}^2+\\varepsilon)$, using the same `target_full` series Section 5 already computed."
+))
+cells.append(code("""STANDALONE_FEATURE_COLS = ['return', 'roll_std_5', 'roll_std_21', 'sq_ret']
+
+standalone_feat = pd.DataFrame({'return': portfolio})
+standalone_feat['roll_std_5']  = portfolio.rolling(5).std()
+standalone_feat['roll_std_21'] = portfolio.rolling(21).std()
+standalone_feat['sq_ret']      = portfolio ** 2
+standalone_feat = standalone_feat.dropna()
+
+print(f"Standalone feature frame: {standalone_feat.shape}, columns: {STANDALONE_FEATURE_COLS}")
+print(f"Missing values: {standalone_feat.isna().sum().sum()}")
+"""))
+
+cells.append(code("""standalone_X_all, standalone_y_all, standalone_dates_all = build_sequences(
+    standalone_feat, target_full, STANDALONE_FEATURE_COLS, LOOKBACK)
+
+standalone_is_train = standalone_dates_all.isin(train_idx)
+standalone_X_train_seq, standalone_y_train_seq = standalone_X_all[standalone_is_train], standalone_y_all[standalone_is_train]
+standalone_X_test_seq,  standalone_y_test_seq,  standalone_test_seq_dates = (
+    standalone_X_all[~standalone_is_train], standalone_y_all[~standalone_is_train], standalone_dates_all[~standalone_is_train])
+
+print(f"Sequence shape        : {standalone_X_all.shape}  (samples, lookback={LOOKBACK}, features={len(STANDALONE_FEATURE_COLS)})")
+print(f"Training sequences    : {standalone_X_train_seq.shape}")
+print(f"Test sequences        : {standalone_X_test_seq.shape}")
+
+assert np.array_equal(standalone_test_seq_dates.values, test_seq_dates.values), (
+    "Standalone test sequence dates must match the Hybrid model's evaluation window exactly.")
+print("Confirmed: identical evaluation window to the Hybrid model (later aliased as EVAL_IDX in Section 6).")
+"""))
+
+cells.append(md(
+    "### 5B.2 Feature scaling\n\n"
+    "A separate `StandardScaler` is fitted on this model's own training sequences only, exactly as in "
+    "Section 5.2, so no statistic derived from the Hybrid model's feature set leaks in."
+))
+cells.append(code("""standalone_n_features = len(STANDALONE_FEATURE_COLS)
+standalone_scaler = StandardScaler()
+standalone_scaler.fit(standalone_X_train_seq.reshape(-1, standalone_n_features))
+
+standalone_X_train_scaled = standalone_scaler.transform(
+    standalone_X_train_seq.reshape(-1, standalone_n_features)).reshape(standalone_X_train_seq.shape).astype('float32')
+standalone_X_test_scaled = standalone_scaler.transform(
+    standalone_X_test_seq.reshape(-1, standalone_n_features)).reshape(standalone_X_test_seq.shape).astype('float32')
+
+print("Scaler fitted on this model's own training sequences only.")
+print(pd.DataFrame({'mean': standalone_scaler.mean_, 'scale': standalone_scaler.scale_},
+                    index=STANDALONE_FEATURE_COLS).round(5).to_string())
+"""))
+
+cells.append(md(
+    "### 5B.3 Architecture and training\n\n"
+    "The network is identical in shape and training procedure to the refinement LSTM in Section 5.3 — "
+    "LSTM(32) → Dropout(0.2) → Dense(16) → Dense(1), Adam, early stopping on a 15% validation split with "
+    "patience 10 — so that a difference in outcome reflects the input features, not the architecture."
+))
+cells.append(code("""standalone_lstm_model = keras.Sequential([
+    layers.Input(shape=(LOOKBACK, standalone_n_features)),
+    layers.LSTM(32, return_sequences=False),
+    layers.Dropout(0.2),
+    layers.Dense(16, activation='relu'),
+    layers.Dense(1),
+], name='lstm_standalone_model')
+
+standalone_lstm_model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+standalone_lstm_model.summary()
+"""))
+
+cells.append(code("""standalone_history = standalone_lstm_model.fit(
+    standalone_X_train_scaled, standalone_y_train_seq,
+    validation_split=0.15, epochs=100, batch_size=32, shuffle=True, verbose=0,
+    callbacks=[keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)],
+)
+
+standalone_n_epochs = len(standalone_history.history['loss'])
+print(f"Training stopped after {standalone_n_epochs} epochs")
+print(f"Final training loss   : {standalone_history.history['loss'][-1]:.4f}")
+print(f"Final validation loss : {standalone_history.history['val_loss'][-1]:.4f}")
+"""))
+
+cells.append(code("""fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(standalone_history.history['loss'], color='steelblue', label='Training loss')
+ax.plot(standalone_history.history['val_loss'], color='firebrick', label='Validation loss')
+ax.set_xlabel('Epoch')
+ax.set_ylabel('MSE (log-variance scale)')
+ax.set_title('Standalone LSTM — training history')
+ax.legend(frameon=False)
+plt.tight_layout()
+plt.savefig(FIGURES_DIR / 'lstm_standalone_training_history.png', bbox_inches='tight')
+plt.show()
+"""))
+
+cells.append(md(
+    "### 5B.4 From log-variance to volatility\n\n"
+    "The same Duan (1983) smearing correction used for the Hybrid model is applied here, computed from "
+    "this model's own in-sample residuals rather than borrowed from Section 5.4."
+))
+cells.append(code("""standalone_train_pred_log = standalone_lstm_model.predict(standalone_X_train_scaled, verbose=0).flatten()
+standalone_resid_train    = standalone_y_train_seq - standalone_train_pred_log
+standalone_smearing_factor = float(np.mean(np.exp(standalone_resid_train)))
+print(f"Duan smearing factor: {standalone_smearing_factor:.4f}")
+
+standalone_test_pred_log = standalone_lstm_model.predict(standalone_X_test_scaled, verbose=0).flatten()
+standalone_var   = pd.Series(np.exp(standalone_test_pred_log) * standalone_smearing_factor, index=standalone_test_seq_dates)
+standalone_sigma = np.sqrt(standalone_var)
+
+print(f"Mean standalone forecast volatility : {standalone_sigma.mean()*100:.3f}%")
+print(f"Actual test-period volatility        : {portfolio.loc[test_idx].std()*100:.3f}%")
+"""))
+
+cells.append(md(
+    "### 5B.5 Evaluation\n\n"
+    "The standalone model is scored exactly as every model in Section 6 is: the same six accuracy "
+    "metrics against the realised volatility proxy, and the same Student-t VaR construction, Kupiec "
+    "test, Christoffersen test and Expected Shortfall ratio at 95% and 99%, on the identical evaluation "
+    "window Section 6 later names `EVAL_IDX`. The backtesting functions are defined again here, "
+    "identically, purely so that this section can run and be reviewed on its own before Section 6 does; "
+    "Section 6.2 defines them again unchanged."
+))
+cells.append(code("""def kupiec_test(violations, alpha):
+    T, x = len(violations), int(violations.sum())
+    pi_hat = np.clip(x / T, 1e-6, 1 - 1e-6)
+    ll_null = (T - x) * np.log(1 - alpha) + x * np.log(alpha)
+    ll_alt  = (T - x) * np.log(1 - pi_hat) + x * np.log(pi_hat)
+    lr = -2 * (ll_null - ll_alt)
+    return lr, 1 - stats.chi2.cdf(lr, df=1)
+
+def christoffersen_test(violations):
+    v = violations.astype(int).values
+    n00 = n01 = n10 = n11 = 0
+    for prev, cur in zip(v[:-1], v[1:]):
+        n00 += prev == 0 and cur == 0
+        n01 += prev == 0 and cur == 1
+        n10 += prev == 1 and cur == 0
+        n11 += prev == 1 and cur == 1
+    pi01 = n01 / (n00 + n01) if (n00 + n01) else 0.0
+    pi11 = n11 / (n10 + n11) if (n10 + n11) else 0.0
+    pi   = (n01 + n11) / (n00 + n01 + n10 + n11)
+    safe_log = lambda x: np.log(np.clip(x, 1e-10, 1 - 1e-10))
+    ll_null = (n00 + n10) * safe_log(1 - pi)   + (n01 + n11) * safe_log(pi)
+    ll_alt  = n00 * safe_log(1 - pi01) + n01 * safe_log(pi01) + n10 * safe_log(1 - pi11) + n11 * safe_log(pi11)
+    lr = -2 * (ll_null - ll_alt)
+    return lr, 1 - stats.chi2.cdf(lr, df=1)
+
+def es_backtest_ratio(actual, var_est, es_est):
+    breach = actual < -var_est
+    if breach.sum() == 0:
+        return np.nan
+    return (-actual[breach]).mean() / es_est[breach].mean()
+
+def adjusted_r2(r2, n, p):
+    return 1 - (1 - r2) * (n - 1) / (n - p - 1)
+"""))
+
+cells.append(code("""standalone_eval_idx     = standalone_test_seq_dates
+standalone_actual_eval  = actual_next_ret.reindex(standalone_eval_idx)
+standalone_realised_vol = standalone_actual_eval.abs()
+
+standalone_rmse    = np.sqrt(np.mean((standalone_sigma - standalone_realised_vol) ** 2))
+standalone_mae     = mean_absolute_error(standalone_realised_vol, standalone_sigma)
+standalone_mape    = mean_absolute_percentage_error(standalone_realised_vol.clip(lower=1e-4), standalone_sigma.clip(lower=1e-4))
+standalone_r2      = r2_score(standalone_realised_vol, standalone_sigma)
+standalone_adj_r2  = adjusted_r2(standalone_r2, len(standalone_realised_vol), len(STANDALONE_FEATURE_COLS))
+standalone_dir_acc = (np.sign(standalone_sigma.diff()) == np.sign(standalone_realised_vol.diff())).mean() * 100
+
+standalone_performance = pd.DataFrame([{
+    'Model': 'Standalone LSTM', 'RMSE': standalone_rmse, 'MAE': standalone_mae, 'MAPE': standalone_mape,
+    'R2': standalone_r2, 'Adj. R2': standalone_adj_r2, 'Directional Acc. (%)': standalone_dir_acc,
+}]).set_index('Model')
+print(standalone_performance.round(4).to_string())
+"""))
+
+cells.append(code("""standalone_nu_flat = max(4.0, 6.0 / (portfolio.loc[train_idx].kurtosis() / 3.0 + 1.0))
+standalone_mu_eval = mu_roll.reindex(standalone_eval_idx)
+
+standalone_var_cl, standalone_es_cl = {}, {}
+for cl in CONF_LEVELS:
+    alpha = 1 - cl
+    q, es_z = student_t_quantiles(alpha, standalone_nu_flat)
+    standalone_var_cl[cl] = -(standalone_mu_eval + standalone_sigma.reindex(standalone_eval_idx) * q)
+    standalone_es_cl[cl]  = -(standalone_mu_eval + standalone_sigma.reindex(standalone_eval_idx) * es_z)
+
+standalone_backtest_rows = []
+for cl in CONF_LEVELS:
+    alpha = 1 - cl
+    var_est, es_est = standalone_var_cl[cl], standalone_es_cl[cl]
+    v = (standalone_actual_eval < -var_est)
+    lr_pof, p_pof = kupiec_test(v, alpha)
+    lr_ind, p_ind = christoffersen_test(v)
+    es_ratio = es_backtest_ratio(standalone_actual_eval, var_est, es_est)
+    standalone_backtest_rows.append({'Model': 'Standalone LSTM', 'CL': cl, 'Violations': int(v.sum()),
+                                      'Violation Rate (%)': v.mean() * 100, 'Kupiec LR': lr_pof, 'Kupiec p': p_pof,
+                                      'Christoffersen LR': lr_ind, 'Christoffersen p': p_ind, 'ES Ratio': es_ratio})
+
+standalone_backtest = pd.DataFrame(standalone_backtest_rows).set_index(['Model', 'CL'])
+print(standalone_backtest.round(4).to_string())
+"""))
+
+cells.append(md(
+    "### 5B.6 Model persistence\n\n"
+    "Saved under filenames distinct from every existing artefact in `models/`, so nothing there is "
+    "overwritten."
+))
+cells.append(code("""standalone_lstm_model.save(MODELS_DIR / 'lstm_standalone_model.keras')
+joblib.dump(standalone_scaler, MODELS_DIR / 'lstm_standalone_feature_scaler.joblib')
+
+standalone_results = {
+    'feature_columns': STANDALONE_FEATURE_COLS,
+    'lookback': LOOKBACK,
+    'smearing_factor': standalone_smearing_factor,
+    'student_t_dof': standalone_nu_flat,
+    'performance': standalone_performance,
+    'backtest': standalone_backtest,
+    'eval_period': (standalone_eval_idx.min(), standalone_eval_idx.max()),
+}
+with open(MODELS_DIR / 'lstm_standalone_results.pkl', 'wb') as f:
+    pickle.dump(standalone_results, f)
+
+print("Saved: lstm_standalone_model.keras, lstm_standalone_feature_scaler.joblib, lstm_standalone_results.pkl")
+"""))
+
 
 # 6. Model Evaluation
 cells.append(md(
@@ -675,6 +917,41 @@ axes[2].set_ylabel('Sample quantiles')
 plt.suptitle('Hybrid ML-GARCH residual diagnostics', y=1.02)
 plt.tight_layout()
 plt.savefig(FIGURES_DIR / 'hybrid_residual_diagnostics.png', bbox_inches='tight')
+plt.show()
+"""))
+
+cells.append(md(
+    "### 6.4 Standalone LSTM — comparison against the full model suite\n\n"
+    "The Standalone LSTM built in Section 5B is now placed alongside GARCH, EGARCH, GJR-GARCH and the "
+    "Hybrid model in one table, using exactly the `performance_df` and `backtest_df` computed above with "
+    "no changes to either. The combined tables are written to new files; `model_performance_metrics.csv` "
+    "and `var_backtest_summary.csv` are left exactly as Section 6.1 and 6.2 wrote them."
+))
+cells.append(code("""combined_performance = pd.concat([performance_df, standalone_performance]).sort_values('RMSE')
+combined_backtest    = pd.concat([backtest_df, standalone_backtest]).sort_index()
+
+print("Combined performance comparison — four existing models + Standalone LSTM")
+print(combined_performance.round(4).to_string())
+print("\\nCombined VaR backtest comparison — four existing models + Standalone LSTM")
+print(combined_backtest.round(4).to_string())
+
+combined_performance.to_csv(RESULTS_DIR / 'model_performance_metrics_with_standalone_lstm.csv')
+combined_backtest.to_csv(RESULTS_DIR / 'var_backtest_summary_with_standalone_lstm.csv')
+"""))
+
+cells.append(code("""fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+combined_colors = {**colors, 'Standalone LSTM': '#CCB974'}
+for ax, cl in zip(axes, CONF_LEVELS):
+    sub = combined_backtest.xs(cl, level='CL')
+    ax.bar(sub.index, sub['Violation Rate (%)'], color=[combined_colors[m] for m in sub.index], alpha=0.85)
+    ax.axhline((1 - cl) * 100, color='black', ls='--', lw=1, label='Nominal')
+    ax.set_ylabel('Violation rate (%)')
+    ax.set_title(f'{cl:.0%} VaR')
+    ax.tick_params(axis='x', rotation=20)
+    ax.legend(frameon=False, fontsize=8)
+plt.suptitle('Violation rate — four existing models + Standalone LSTM', y=1.02)
+plt.tight_layout()
+plt.savefig(FIGURES_DIR / 'standalone_lstm_comparison.png', bbox_inches='tight')
 plt.show()
 """))
 
